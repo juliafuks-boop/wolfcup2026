@@ -8,7 +8,7 @@ Internal World Cup 2026 prediction competition for Overwolf colleagues.
 - They predict the outcome + exact score of any match before kickoff
 - Points: **+1 correct winner · +2 exact score** (max 3 per match)
 - Real-time shared leaderboard — everyone sees the same standings
-- Match results sync automatically every hour from the API-Football live feed
+- Match results sync automatically each day from the football-data.org feed
 
 ---
 
@@ -22,11 +22,12 @@ Internal World Cup 2026 prediction competition for Overwolf colleagues.
    - **service_role key** (secret — server only)
 3. In the Supabase dashboard → **SQL Editor → New query**, paste the entire contents of [`supabase/schema.sql`](supabase/schema.sql) and run it.
 
-### 2. Get an API-Football key
+### 2. Get a football-data.org API key
 
-1. Go to [api-football.com](https://www.api-football.com) (or via RapidAPI)
-2. Sign up for a free account → copy your **API key**
-3. Free tier: 100 requests/day — the hourly cron uses ≤ 24/day, so you're fine
+1. Go to [football-data.org](https://www.football-data.org) → register for a free token
+2. Copy your **API token** — it has free access to the FIFA World Cup competition (`WC`)
+3. The daily cron makes 1 request/day, well within the free tier
+4. Store it in the `API_FOOTBALL_KEY` env var (the sync sends it as the `X-Auth-Token` header)
 
 ### 3. Deploy to Vercel
 
@@ -39,7 +40,7 @@ Internal World Cup 2026 prediction competition for Overwolf colleagues.
    | `SUPABASE_URL` | Your Supabase project URL |
    | `SUPABASE_ANON_KEY` | Supabase anon/public key |
    | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service_role key (keep secret) |
-   | `API_FOOTBALL_KEY` | Your API-Football key |
+   | `API_FOOTBALL_KEY` | Your football-data.org token |
    | `ADMIN_KEY` | A password of your choosing (e.g. `wolfcup2026`) |
 
 4. Deploy. Vercel will automatically schedule the hourly results sync.
@@ -95,7 +96,7 @@ ADMIN_KEY=wolfcup2026
 public/index.html          The app (all UI — CSS, HTML, JavaScript)
 api/
   config.js                Returns Supabase public config to the browser
-  sync-results.js          Vercel cron: hourly API-Football → Supabase sync
+  sync-results.js          Vercel cron: daily football-data.org → Supabase sync
   admin-result.js          Admin result entry (server-side write)
 supabase/schema.sql        Tables, RLS policies, leaderboard view
 scripts/seed-matches.mjs   One-time fixture seed

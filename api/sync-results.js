@@ -1,14 +1,19 @@
 /**
  * api/sync-results.js
- * Vercel serverless function — called hourly by the cron in vercel.json.
- * Fetches all World Cup 2026 fixtures from API-Football and upserts
- * scores, status, kickoff times, and resolved team names into Supabase.
+ * Vercel serverless function — called daily by the cron in vercel.json.
+ * Fetches all FIFA World Cup 2026 fixtures from football-data.org and
+ * overlays real kickoff times, authoritative home/away ordering, status,
+ * and scores onto our seeded m1..m104 rows in Supabase.
  *
  * Can also be triggered manually: GET /api/sync-results?key=ADMIN_KEY
+ *
+ * NOTE: process.env.API_FOOTBALL_KEY holds a football-data.org API token
+ * (header: X-Auth-Token), NOT an api-sports.io key.
  */
 
 import { createClient } from '@supabase/supabase-js';
 
+// Our 3-letter code → flag emoji (matches the seed's codes)
 const FLAG_MAP = {
   MEX:'🇲🇽', RSA:'🇿🇦', KOR:'🇰🇷', CZE:'🇨🇿',
   CAN:'🇨🇦', BIH:'🇧🇦', QAT:'🇶🇦', SUI:'🇨🇭',
@@ -24,37 +29,43 @@ const FLAG_MAP = {
   ENG:'🏴󠁧󠁢󠁥󠁮󠁧󠁿', CRO:'🇭🇷', GHA:'🇬🇭', PAN:'🇵🇦',
 };
 
-// Normalise team name → our code (handles API name variations)
-const NAME_TO_CODE = {
-  'Mexico':'MEX','South Africa':'RSA','South Korea':'KOR','Korea Republic':'KOR',
-  'Czechia':'CZE','Czech Republic':'CZE','Canada':'CAN','Bosnia':'BIH',
-  'Bosnia and Herzegovina':'BIH','Bosnia & Herzegovina':'BIH',
-  'Qatar':'QAT','Switzerland':'SUI','Brazil':'BRA','Morocco':'MAR',
-  'Haiti':'HAI','Scotland':'SCO','USA':'USA','United States':'USA',
-  'Paraguay':'PAR','Australia':'AUS','Turkey':'TUR','Türkiye':'TUR',
-  'Germany':'GER','Curaçao':'CUW','Curacao':'CUW',"Côte d'Ivoire":'CIV',
-  "Cote d'Ivoire":'CIV','Ivory Coast':'CIV','Ecuador':'ECU',
-  'Netherlands':'NED','Japan':'JPN','Tunisia':'TUN','Sweden':'SWE',
-  'Belgium':'BEL','Egypt':'EGY','Iran':'IRN','New Zealand':'NZL',
-  'Spain':'ESP','Cabo Verde':'CPV','Cape Verde':'CPV','Saudi Arabia':'KSA',
-  'Uruguay':'URU','France':'FRA','Senegal':'SEN','Norway':'NOR','Iraq':'IRQ',
-  'Argentina':'ARG','Algeria':'ALG','Austria':'AUT','Jordan':'JOR',
-  'Portugal':'POR','Uzbekistan':'UZB','Colombia':'COL','Congo DR':'COD',
-  'DR Congo':'COD','England':'ENG','Croatia':'CRO','Ghana':'GHA','Panama':'PAN',
+// football-data.org tla → our seed code (only where they differ)
+const CODE_ALIAS = { CUR:'CUW', URY:'URU' };
+const ourCode = tla => tla ? (CODE_ALIAS[tla] || tla) : null;
+const toFlag  = code => FLAG_MAP[code] || '🏳️';
+
+const STAGE_MAP = {
+  GROUP_STAGE:'group', LAST_32:'r32', LAST_16:'r16',
+  QUARTER_FINALS:'qf', SEMI_FINALS:'sf', THIRD_PLACE:'3rd', FINAL:'final',
 };
 
-function toCode(name) { return NAME_TO_CODE[name] || name.toUpperCase().slice(0,3); }
-function toFlag(code) { return FLAG_MAP[code] || '🏳️'; }
-
-function apiStatusToOurs(s) {
-  if (['FT','AET','PEN','AWD','WO'].includes(s)) return 'completed';
-  if (['1H','HT','2H','ET','BT','P','SUSP','INT','LIVE'].includes(s)) return 'live';
+function statusOf(s) {
+  if (['FINISHED', 'AWARDED'].includes(s)) return 'completed';
+  if (['IN_PLAY', 'PAUSED'].includes(s))   return 'live';
   return 'upcoming';
 }
 
+// Build the partial update for one of our rows from an API fixture.
+// Omitted columns (stadium, city, etc.) are preserved by the upsert.
+function buildPatch(id, f, hc, ac) {
+  const status = statusOf(f.status);
+  const patch = { id, kickoff_utc: f.utcDate, status };
+  if (f.matchday) patch.matchday = f.matchday;
+  if (hc && f.homeTeam && f.homeTeam.name) {
+    patch.home_name = f.homeTeam.name; patch.home_code = hc; patch.home_flag = toFlag(hc);
+  }
+  if (ac && f.awayTeam && f.awayTeam.name) {
+    patch.away_name = f.awayTeam.name; patch.away_code = ac; patch.away_flag = toFlag(ac);
+  }
+  if (status === 'completed' || status === 'live') {
+    patch.home_score = (f.score && f.score.fullTime) ? (f.score.fullTime.home ?? null) : null;
+    patch.away_score = (f.score && f.score.fullTime) ? (f.score.fullTime.away ?? null) : null;
+  }
+  return patch;
+}
+
 export default async function handler(req, res) {
-  // Allow manual trigger with admin key, or from Vercel cron (no auth header needed on cron)
-  const isCron = req.headers['x-vercel-cron'] === '1';
+  const isCron   = req.headers['x-vercel-cron'] === '1';
   const isManual = req.query.key === process.env.ADMIN_KEY;
   if (!isCron && !isManual) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -65,87 +76,76 @@ export default async function handler(req, res) {
     process.env.SUPABASE_SERVICE_ROLE_KEY
   );
 
-  // Fetch all WC 2026 fixtures from API-Football
-  let apiFixtures;
+  // Fetch all WC 2026 fixtures from football-data.org
+  let apiMatches;
   try {
     const apires = await fetch(
-      'https://v3.football.api-sports.io/fixtures?league=1&season=2026',
-      { headers: { 'x-apisports-key': process.env.API_FOOTBALL_KEY } }
+      'https://api.football-data.org/v4/competitions/WC/matches',
+      { headers: { 'X-Auth-Token': process.env.API_FOOTBALL_KEY } }
     );
     const json = await apires.json();
-    apiFixtures = json.response;
+    apiMatches = json.matches;
   } catch (err) {
-    return res.status(502).json({ error: 'API-Football fetch failed', detail: err.message });
+    return res.status(502).json({ error: 'football-data.org fetch failed', detail: err.message });
   }
 
-  if (!Array.isArray(apiFixtures) || apiFixtures.length === 0) {
+  if (!Array.isArray(apiMatches) || apiMatches.length === 0) {
     return res.status(200).json({ message: 'No fixtures returned from API', count: 0 });
   }
 
-  // Load our matches so we can map api_fixture_id → match id
-  const { data: ourMatches } = await supabase.from('matches').select('id,home_code,away_code,matchday,round,api_fixture_id');
+  // Load our seeded rows
+  const { data: ourMatches, error: loadErr } = await supabase
+    .from('matches').select('id,home_code,away_code,matchday,round');
+  if (loadErr) return res.status(500).json({ error: loadErr.message });
 
-  // Build lookup: by api_fixture_id first (fast path for re-runs), then by teams+matchday
-  const byApiId = {};
-  const byTeamMatchday = {};
+  // Each team-pair plays exactly once in the group stage, and pairs never
+  // repeat across groups — so the unordered pair alone is a unique key.
+  // (Matching on matchday too would miss fixtures the seed mis-dated.)
+  const pairKey = (a, b) => [a, b].sort().join('-');
+
+  // Index: group matches by unordered team-pair; everything by stage.
+  const ourGroupByKey = {};
+  const ourByStage = {};
   for (const m of ourMatches) {
-    if (m.api_fixture_id) byApiId[m.api_fixture_id] = m;
-    // Key: "homeCode-awayCode-matchday" for group games, "homeCode-awayCode-round" for KO
-    const key = `${m.home_code}-${m.away_code}-${m.matchday || m.round}`;
-    byTeamMatchday[key] = m;
+    if (m.round === 'group') {
+      ourGroupByKey[pairKey(m.home_code, m.away_code)] = m;
+    }
+    (ourByStage[m.round] = ourByStage[m.round] || []).push(m);
+  }
+  for (const k in ourByStage) {
+    ourByStage[k].sort((a, b) => parseInt(a.id.slice(1), 10) - parseInt(b.id.slice(1), 10));
   }
 
   const upserts = [];
+  const apiByStage = {};
 
-  for (const f of apiFixtures) {
-    const fix = f.fixture;
-    const teams = f.teams;
-    const goals = f.goals;
-    const league = f.league;
+  // Group stage: match by team-pair + matchday (handles home/away swaps).
+  for (const f of apiMatches) {
+    const round = STAGE_MAP[f.stage] || 'group';
+    (apiByStage[round] = apiByStage[round] || []).push(f);
+    if (round !== 'group') continue;
 
-    const homeCode = toCode(teams.home.name);
-    const awayCode = toCode(teams.away.name);
-    const apiRound = (league.round || '').toLowerCase();
-    // Derive matchday number from "Group Stage - 1" style strings
-    const mdMatch = apiRound.match(/(\d+)$/);
-    const matchday = mdMatch ? parseInt(mdMatch[1]) : 0;
+    const hc = ourCode(f.homeTeam && f.homeTeam.tla);
+    const ac = ourCode(f.awayTeam && f.awayTeam.tla);
+    if (!hc || !ac) continue;
+    const match = ourGroupByKey[pairKey(hc, ac)];
+    if (!match) continue;
+    upserts.push(buildPatch(match.id, f, hc, ac));
+  }
 
-    // Derive our round label
-    let round = 'group';
-    if (apiRound.includes('round of 32'))    round = 'r32';
-    else if (apiRound.includes('round of 16')) round = 'r16';
-    else if (apiRound.includes('quarter'))    round = 'qf';
-    else if (apiRound.includes('semi'))       round = 'sf';
-    else if (apiRound.includes('3rd'))        round = '3rd';
-    else if (apiRound.includes('final'))      round = 'final';
-
-    const keyForKO  = `${homeCode}-${awayCode}-${round}`;
-    const keyForGrp = `${homeCode}-${awayCode}-${matchday}`;
-
-    let matched = byApiId[fix.id]
-      || byTeamMatchday[keyForGrp]
-      || byTeamMatchday[keyForKO];
-
-    if (!matched) continue; // fixture not in our list yet (e.g., venue TBDs)
-
-    const status = apiStatusToOurs(fix.status.short);
-    const patch = {
-      id:             matched.id,
-      api_fixture_id: fix.id,
-      kickoff_utc:    fix.date,
-      status,
-      home_name: teams.home.name,
-      home_code: homeCode,
-      home_flag: toFlag(homeCode),
-      away_name: teams.away.name,
-      away_code: awayCode,
-      away_flag: toFlag(awayCode),
-    };
-    if (status === 'completed' || status === 'live') {
-      patch.home_score = goals.home ?? null;
-      patch.away_score = goals.away ?? null;
+  // Knockouts: teams are undecided until the bracket fills, so zip each
+  // stage's fixtures by kickoff time. This sets kickoff_utc/status/scores
+  // now and resolves real teams automatically once the API knows them.
+  for (const round of ['r32', 'r16', 'qf', 'sf', '3rd', 'final']) {
+    const ours = ourByStage[round] || [];
+    const apis = (apiByStage[round] || []).slice()
+      .sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate));
+    for (let i = 0; i < ours.length && i < apis.length; i++) {
+      const f = apis[i];
+      const hc = ourCode(f.homeTeam && f.homeTeam.tla);
+      const ac = ourCode(f.awayTeam && f.awayTeam.tla);
+      upserts.push(buildPatch(ours[i].id, f, hc, ac));
     }
-    upserts.push(patch);
   }
 
   if (upserts.length === 0) {
