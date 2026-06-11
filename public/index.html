@@ -1820,7 +1820,8 @@ async function submitSignup() {
   }).select().single();
 
   if (error) {
-    errEl.textContent = 'Could not save your profile — please try again.';
+    errEl.textContent = 'Error: ' + (error.message || error.code || JSON.stringify(error));
+    console.error('Supabase players insert error:', error);
     btn.textContent = 'JOIN THE PACK →'; btn.disabled = false;
     return;
   }
