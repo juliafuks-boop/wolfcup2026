@@ -1697,8 +1697,11 @@ function isMatchLocked(match) {
 //   DATA FETCHING
 // ══════════════════════════════════════════════
 async function fetchMatches() {
-  const { data, error } = await db.from('matches').select('*').order('id');
-  if (!error && data) MATCHES = data.map(dbRowToMatch);
+  const { data, error } = await db.from('matches').select('*');
+  if (!error && data) {
+    MATCHES = data.map(dbRowToMatch)
+      .sort((a, b) => parseInt(a.id.slice(1), 10) - parseInt(b.id.slice(1), 10));
+  }
 }
 
 async function fetchMyPredictions() {
@@ -2159,6 +2162,7 @@ function renderHomeMatches() {
   if (!grid) return;
   grid.innerHTML = '';
   MATCHES.filter(m => !isMatchLocked(m) && m.home.code !== 'TBD').slice(0, 3).forEach(m => grid.appendChild(buildMatchCard(m)));
+  grid.querySelectorAll('.reveal').forEach(el => el.classList.add('visible'));
 }
 
 function renderPredictionsPage() {
@@ -2167,6 +2171,9 @@ function renderPredictionsPage() {
   grid.innerHTML = '';
   const filtered = currentFilter === 'all' ? MATCHES : MATCHES.filter(m => m.round === currentFilter);
   filtered.forEach(m => grid.appendChild(buildMatchCard(m)));
+  // Reveal immediately — the IntersectionObserver is unreliable for cards
+  // appended dynamically on navigation, leaving them stuck at opacity:0.
+  grid.querySelectorAll('.reveal').forEach(el => el.classList.add('visible'));
   updateStats();
 }
 
