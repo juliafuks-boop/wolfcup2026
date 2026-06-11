@@ -93,10 +93,15 @@ export default async function handler(req, res) {
     return res.status(200).json({ message: 'No fixtures returned from API', count: 0 });
   }
 
-  // Load our seeded rows
+  // Load our seeded rows IN FULL — Supabase upsert runs as INSERT ... ON
+  // CONFLICT, so every NOT NULL column must be present in each row. We merge
+  // each API patch onto the complete existing row before upserting.
   const { data: ourMatches, error: loadErr } = await supabase
-    .from('matches').select('id,home_code,away_code,matchday,round');
+    .from('matches').select('*');
   if (loadErr) return res.status(500).json({ error: loadErr.message });
+
+  const fullById = {};
+  for (const m of ourMatches) fullById[m.id] = m;
 
   // Each team-pair plays exactly once in the group stage, and pairs never
   // repeat across groups — so the unordered pair alone is a unique key.
@@ -130,7 +135,7 @@ export default async function handler(req, res) {
     if (!hc || !ac) continue;
     const match = ourGroupByKey[pairKey(hc, ac)];
     if (!match) continue;
-    upserts.push(buildPatch(match.id, f, hc, ac));
+    upserts.push({ ...fullById[match.id], ...buildPatch(match.id, f, hc, ac) });
   }
 
   // Knockouts: teams are undecided until the bracket fills, so zip each
@@ -144,7 +149,7 @@ export default async function handler(req, res) {
       const f = apis[i];
       const hc = ourCode(f.homeTeam && f.homeTeam.tla);
       const ac = ourCode(f.awayTeam && f.awayTeam.tla);
-      upserts.push(buildPatch(ours[i].id, f, hc, ac));
+      upserts.push({ ...fullById[ours[i].id], ...buildPatch(ours[i].id, f, hc, ac) });
     }
   }
 
